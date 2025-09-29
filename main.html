@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Web Serial 스마트 하우스 컨트롤러 (수정 완료)</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f9; }
+        .container { max-width: 600px; margin: auto; padding: 20px; border-radius: 8px; background-color: #fff; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
+        h2 { text-align: center; color: #333; }
+        button { padding: 10px 15px; margin: 5px; border: none; border-radius: 5px; cursor: pointer; transition: background-color 0.3s; font-weight: bold; }
+        #connectButton { background-color: #4CAF50; color: white; }
+        #connectButton:hover { background-color: #45a049; }
+        .control-group { margin-top: 20px; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }
+        .control-group label { display: block; margin-bottom: 8px; font-weight: bold; }
+        .control-group input[type="range"] { width: 100%; margin-bottom: 10px; }
+        #status { margin-top: 20px; padding: 10px; border: 1px solid #ccc; border-radius: 5px; background-color: #e9ecef; white-space: pre-wrap; }
+        .data-display { margin-top: 10px; padding: 10px; border: 1px solid #007bff; background-color: #eaf6ff; border-radius: 5px; font-size: 1.1em; }
+        .data-display span { font-weight: bold; color: #007bff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>스마트 하우스 Web Serial 컨트롤러 🏠</h2>
+        <button id="connectButton">시리얼 포트 연결 (Baud Rate: 115200)</button>
+
+        <div class="data-display">
+            온도: <span id="tempDisplay">--</span> °C<br>
+            습도: <span id="humidityDisplay">--</span> %
+        </div>
+
+        <div class="control-group">
+            <label>💡 NeoPixel LED 제어</label>
+            <button onclick="sendSerialData('n')" style="background-color: #ffc107;">켜기 (흰색)</button>
+            <button onclick="sendSerialData('f')" style="background-color: #dc3545; color: white;">끄기 (검은색)</button>
+        </div>
+
+        <div class="control-group">
+            <label for="servoAngle">⚙️ 서보 모터 각도 제어 (<span id="angleValue">0</span>°)</label>
+            <input type="range" id="servoAngle" min="0" max="180" value="0" step="1" oninput="updateAngle(this.value)">
+            <button onclick="sendServoAngle()" style="background-color: #007bff; color: white;">각도 전송</button>
+        </div>
+
+        <div id="status">상태: 연결되지 않음</div>
+    </div>
+
+    <script>
+        const BAUD_RATE = 115200;
+        let port;
+        let inputDone;
+        let outputDone;
+        let outputStream;
+
+        const connectButton = document.getElementById('connectButton');
+        const statusDiv = document.getElementById('status');
+        const tempDisplay = document.getElementById('tempDisplay');
+        const humidityDisplay = document.getElementById('humidityDisplay');
+        const angleValueSpan = document.getElementById('angleValue');
+        const servoAngleInput = document.getElementById('servoAngle');
+
+        connectButton.addEventListener('click', () => {
+            if (port) {
+                disconnect();
+            } else {
+                connect();
+            }
+        });
+
+        // 서보 모터 각도 표시 업데이트
+        function updateAngle(value) {
+            angleValueSpan.textContent = value;
+        }
+
+        // 시리얼 연결
+        async function connect() {
+            try {
+                // 포트 요청 및 열기
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: BAUD_RATE });
+                statusDiv.textContent = `상태: 포트 연결됨 (${BAUD_RATE}bps)`;
+                connectButton.textContent = '연결 해제';
+
+                // 데이터 수신 시작 (수정된 readLoop 사용)
+                readLoop();
+
+                // 데이터 송신 설정
+                outputStream = port.writable.getWriter();
+                outputDone = true;
+
+            } catch (error) {
+                statusDiv.textContent = `상태: 연결 실패: ${error.message}`;
+                port = null; // 연결 실패 시 port 초기화
+            }
+        }
+
+        // 시리얼 연결 해제
+        async function disconnect() {
+            // 송신 스트림 종료
+            if (outputStream) {
+                await outputStream.close();
+                outputStream = null;
+            }
+            
+            // 수신 스트림 및 포트 닫기
+            if (port) {
+                // port.close()는 pipeTo로 연결된 파이프라인을 자연스럽게 종료시킵니다.
+                // inputDone을 기다릴 필요 없이 port.close()를 호출합니다.
+                await port.close(); 
+                port = null;
+            }
+            
+            inputDone = null; // 파이프라인 상태 초기화
+            statusDiv.textContent = '상태: 연결 해제됨';
+            connectButton.textContent = '시리얼 포트 연결';
+        }
+
+        // 💡 수정된 시리얼 데이터 수신 루프: pipeTo만을 사용하여 스트림 Lock 오류 방지
+        async function readLoop() {
+            const textDecoder = new TextDecoder();
+            
+            // port.readable 스트림을 디코더 변환 스트림을 거쳐 WritableStream으로 파이프
+            inputDone = port.readable
+                .pipeThrough(new TransformStream({
+                    transform(chunk, controller) {
+                        // 수신된 Uint8Array 데이터를 텍스트로 디코딩하여 다음 스트림으로 전달
+                        const decodedText = textDecoder.decode(chunk, {stream: true});
+                        controller.enqueue(decodedText);
+                    }
+                }))
+                .pipeTo(new WritableStream({
+                    async write(value) {
+                        // 디코딩된 텍스트 데이터를 처리
+                        processSerialData(value);
+                    }
+                }))
+                .catch(error => {
+                    // 오류가 발생했으나 port가 아직 연결 상태라면 오류 메시지 표시
+                    if (port) {
+                        statusDiv.textContent = `상태: 수신 파이프라인 오류 발생: ${error.message}`;
+                        // 오류 발생 시 연결 해제 시도
+                        disconnect(); 
+                    }
+                });
+        }
+
+        // 수신된 데이터를 처리 (온습도)
+        function processSerialData(data) {
+            // 데이터가 한 번에 여러 줄 포함될 수 있으므로 줄 단위로 처리
+            const lines = data.split('\n');
+            lines.forEach(line => {
+                const trimmedLine = line.trim();
+                // 아두이노에서 전송하는 온습도 형식: "온도,습도"
+                if (trimmedLine.includes(',')) {
+                    const [temp, humidity] = trimmedLine.split(',');
+                    const fTemp = parseFloat(temp);
+                    const fHumidity = parseFloat(humidity);
+
+                    if (!isNaN(fTemp) && !isNaN(fHumidity)) {
+                        tempDisplay.textContent = fTemp.toFixed(2);
+                        humidityDisplay.textContent = fHumidity.toFixed(2);
+                    }
+                }
+            });
+        }
+
+        // 시리얼 데이터 전송
+        async function sendSerialData(data) {
+            if (!port || !outputStream) {
+                statusDiv.textContent = '오류: 먼저 포트에 연결하세요.';
+                return;
+            }
+            try {
+                const encoder = new TextEncoder();
+                // 전송할 데이터에 개행 문자나 캐리지 리턴을 추가할 필요는 없으나
+                // 아두이노의 Serial.read()는 단일 문자를 읽으므로 문자열 전송 시 주의
+                await outputStream.write(encoder.encode(data));
+                statusDiv.textContent = `상태: '${data}' 명령어 전송 완료.`;
+            } catch (error) {
+                statusDiv.textContent = `오류: 데이터 전송 실패: ${error.message}`;
+            }
+        }
+
+        // 서보 각도 전송 ('s' + 각도)
+        function sendServoAngle() {
+            const angle = servoAngleInput.value;
+            // 아두이노 코드의 's' 명령과 serialReadNumber() 함수에 맞게
+            // 's'와 각도 숫자를 붙여서 전송합니다 (예: "s90")
+            const command = `s${angle}`;
+            sendSerialData(command);
+            statusDiv.textContent = `상태: 서보 명령 ('${command}') 전송 완료.`;
+        }
+    </script>
+</body>
+</html>
